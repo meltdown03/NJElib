@@ -76,8 +76,7 @@ class NJE:
 		self.sock	= None
 		self.RHOST	= self.padding(rhost)
 		self.OHOST	= self.padding(ohost)
-		# Default: plain OPEN for non-TLS. setTLS() switches to OPEN SSL.
-		self.TYPE	= self.padding("OPEN")
+		self.TYPE	= self.padding("OPEN")  # setTLS() switches to OPEN SSL
 		self.RIP	= socket.inet_aton(rip)
 		self.connected	= False
 		self.offline	= False
@@ -89,11 +88,10 @@ class NJE:
 		self.certpassword = None
 		self.tls_verify = True
 		self.tls_check_hostname = True
-		self.tls_server_hostname = None  # override for SNI / hostname check
+		self.tls_server_hostname = None
 		self.tls_min_version = ssl.TLSVersion.TLSv1_2
-		# Match typical JES2 AT-TLS policy (TLSv1.2 On / TLSv1.3 On)
 		self.tls_max_version = ssl.TLSVersion.TLSv1_3
-		# OpenSSL names overlapping common CPJES2IN V3CipherSuites (+ TLS1.3)
+		# TLS 1.2 cipher list (set_ciphers). TLS 1.3 suites are separate.
 		self.tls_ciphers = (
 			'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:'
 			'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:'
@@ -107,8 +105,11 @@ class NJE:
 			'DHE-DSS-AES256-SHA256:DHE-DSS-AES128-SHA256:'
 			'@SECLEVEL=1'
 		)
-		# Brief pause after OPEN/ACK so Appl-Controlled AT-TLS can arm.
-		# Keep this short — JES2's TLS handshake timeout is often ~10s.
+		self.tls_ciphersuites = (
+			'TLS_AES_128_GCM_SHA256:'
+			'TLS_AES_256_GCM_SHA384:'
+			'TLS_CHACHA20_POLY1305_SHA256'
+		)
 		self.tls_after_open_delay = 0.2
 		#self.OIP	 = socket.inet_aton(host)
 		self.R		= b'\x00'
@@ -118,22 +119,15 @@ class NJE:
 		self.own_node	= b'\x01' # Node is default 1. Can be changed to anything
 		self.sequence	= 0x80
 		#self.sequence	= b'\x80'
-		# False = plain NJE (port 175). True after setTLS() for OPEN SSL + AT-TLS.
-		self.use_tls_after_open = False
-		# NJE application-level "secure signon" (NCCIFLG x'40' / APPCLU SESSKEY).
-		# Orthogonal to TLS. Leave False unless NODE SIGNON=SECURE is configured.
-		self.nje_secure_signon = False
+		self.use_tls_after_open = False  # enabled by setTLS()
+		self.nje_secure_signon = False   # NCCIFLG x'40' / APPCLU SESSKEY
 		self.signed_on = False
 		if host:
 			self.signon(self.host, self.port)
 
 
 	def connect(self, host, port=0, timeout=30):
-		"""TCP connect in cleartext.
-
-		Plain NJE stays cleartext. With setTLS()/use_tls_after_open, TLS is
-		negotiated later in initiate() after OPEN SSL / ACK (Appl-Controlled AT-TLS).
-		"""
+		"""Connect TCP. TLS (if enabled) is negotiated later after OPEN/ACK."""
 		self.ssl = False
 		if not port:
 			port = NJE_PORT
@@ -155,15 +149,7 @@ class NJE:
 			return False
 
 	def disconnect(self, clean=True):
-		"""Close the connection.
-
-		With clean=True (default), if we are still signed on this sends an NJE
-		type-B signoff, then a TLS close_notify (when using SSL), then a TCP
-		shutdown/close. A bare sock.close() on a TLS session tends to produce
-		a TCP RST and mainframe noise like:
-		  IAZ0545I getpeername() - EDC8124I Socket not connected
-		  IAZ0543I ended due to TCP/IP error, rc: 1124
-		"""
+		"""Close the connection. With clean=True, send NJE type-B signoff first."""
 		self.msg("Disconnecting (clean={0})".format(clean))
 		sock = self.sock
 		do_signoff = (
@@ -176,8 +162,6 @@ class NJE:
 		if do_signoff:
 			try:
 				self._send_signoff_record()
-				# Give the peer a moment to process B before we tear down TLS/TCP
-				time.sleep(0.15)
 			except Exception as e:
 				self.msg("Signoff send failed: {0}".format(e))
 
@@ -189,11 +173,36 @@ class NJE:
 		if not sock:
 			return
 
-		# TLS close_notify when applicable (avoids hard reset with AT-TLS)
+		self._close_socket(sock, after_signoff=do_signoff)
+
+	def _close_socket(self, sock, after_signoff=False):
+		"""Close socket; after signoff wait for peer instead of TLS unwrap."""
+		try:
+			sock.settimeout(2.0)
+		except Exception:
+			pass
+
+		if after_signoff:
+			self.msg("Waiting for peer close after NJE signoff")
+			try:
+				while True:
+					chunk = sock.recv(4096)
+					if not chunk:
+						self.msg("Peer closed after signoff")
+						break
+					self.msg("Discarded {0} byte(s) after signoff".format(len(chunk)))
+			except (OSError, ssl.SSLError) as e:
+				self.msg("Peer close after signoff: {0}".format(e))
+			try:
+				sock.close()
+			except OSError:
+				pass
+			return
+
 		if isinstance(sock, ssl.SSLSocket):
 			try:
 				raw = sock.unwrap()
-				self.msg("TLS close_notify / unwrap OK")
+				self.msg("TLS unwrap OK")
 				sock = raw if raw is not None else sock
 			except Exception as e:
 				self.msg("TLS unwrap failed (continuing close): {0}".format(e))
@@ -208,15 +217,14 @@ class NJE:
 			pass
 
 	def _send_signoff_record(self):
-		"""Send NCCR type B (final signoff) without closing the socket."""
+		"""Send NCCR type B signoff."""
 		self.msg("Sending  >> Signoff Record type: B")
 		if not self.FCS:
 			self.FCS = b"\x8F\xCF"
-		# Same shape JES2 uses: RCB=F0 SRCB=C2 ('B') + two zero bytes
 		self.sendNJE(b"\xF0", b"\xC2", b"\x00\x00", compress=False)
 
 	def signoff(self):
-		"""Send NJE type-B signoff and close the session cleanly."""
+		"""Sign off and close cleanly."""
 		self.disconnect(clean=True)
 
 	def set_offline(self):
@@ -378,15 +386,9 @@ class NJE:
 			return False
 		self.connected = True
 
-		# Secure NJE (OPEN SSL) + Appl-Controlled AT-TLS:
-		# after OPEN/ACK, JES2 arms TTLS as the TLS server; we must complete a
-		# client handshake before SOH ENQ. A short delay avoids a race where
-		# ClientHello arrives before TTLS is active (mainframe then times out
-		# ~10s with IAZ0514I / EZD1286I RC 5004).
+		# TLS upgrade after OPEN/ACK when setTLS() was used
 		if self.use_tls_after_open:
 			if self.tls_after_open_delay:
-				self.msg("Waiting {0}s for AT-TLS to arm before handshake".format(
-					self.tls_after_open_delay))
 				time.sleep(self.tls_after_open_delay)
 			if not self.start_tls():
 				self.msg("Failed to upgrade to TLS after OPEN")
@@ -425,23 +427,11 @@ class NJE:
 		return True
 	def setTLS(self, certfile=None, cafile=None, keyfile=None, password=None,
 			   verify=True, check_hostname=True, server_hostname=None,
-			   min_version=None, max_version=None, after_open_delay=None,
-			   ciphers=None):
-		"""Enable and configure TLS for secure NJE (OPEN SSL + Appl-Controlled AT-TLS).
+			   after_open_delay=None, ciphers=None, ciphersuites=None):
+		"""Enable TLS (OPEN SSL + upgrade after OPEN/ACK).
 
-		Calling this switches the session into TLS mode:
-		  - OPEN type becomes "OPEN SSL"
-		  - use_tls_after_open becomes True (handshake after OPEN/ACK)
-
-		Without setTLS(), the library uses plain OPEN on a cleartext socket
-		(classic non-TLS NJE, typically port 175).
-
-		With a typical CPJES2IN policy (HandshakeRole Server, no ClientAuth),
-		only cafile is required on the client. certfile/keyfile are only needed
-		if the AT-TLS environment requires client authentication.
-
-		cafile should trust the cert on the server keyring (e.g. SYSTEM/TELNET_RING).
-		server_hostname should match that cert's CN/SAN (often ZOS-31).
+		cafile trusts the server cert. certfile/keyfile are optional client certs.
+		ciphers is the TLS 1.2 list; ciphersuites is the TLS 1.3 list.
 		"""
 		self.cafile = cafile
 		self.certfile = certfile
@@ -450,15 +440,12 @@ class NJE:
 		self.tls_verify = verify
 		self.tls_check_hostname = bool(check_hostname and verify)
 		self.tls_server_hostname = server_hostname
-		if min_version is not None:
-			self.tls_min_version = min_version
-		if max_version is not None:
-			self.tls_max_version = max_version
 		if after_open_delay is not None:
 			self.tls_after_open_delay = after_open_delay
 		if ciphers is not None:
 			self.tls_ciphers = ciphers
-		# Enable secure NJE open + post-ACK TLS upgrade
+		if ciphersuites is not None:
+			self.tls_ciphersuites = ciphersuites
 		self.use_tls_after_open = True
 		self.TYPE = self.padding("OPEN SSL")
 		return
@@ -467,32 +454,30 @@ class NJE:
 		if self.ssl:
 			return True
 		try:
-			self.msg("Upgrading to TLS (Appl-Controlled AT-TLS client handshake)...")
+			self.msg("Upgrading to TLS...")
 			if not self.sock:
 				raise OSError("no socket to upgrade")
-			# Fail fast with a clear message if TCP already died (e.g. after
-			# AT-TLS handshake timeout while we were stuck in getData).
 			try:
 				peer = self.sock.getpeername()
 				self.msg("TCP still connected to {0}".format(peer))
 			except OSError as e:
-				raise OSError(
-					"TCP socket not connected before TLS ({0}). "
-					"Usually means the peer already reset the session "
-					"(e.g. while getData blocked waiting for more data)."
-					.format(e)
-				)
+				raise OSError("TCP socket not connected before TLS ({0})".format(e))
 
 			context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 			context.minimum_version = self.tls_min_version
 			context.maximum_version = self.tls_max_version
-			# Prefer suites that overlap common JES2 AT-TLS V3CipherSuites.
-			# TLS 1.3 suites are selected automatically when TLSv1.3 is enabled.
 			try:
 				context.set_ciphers(self.tls_ciphers)
 			except ssl.SSLError as e:
-				self.msg("Custom cipher list rejected ({0}); falling back to DEFAULT".format(e))
+				self.msg("Cipher list rejected ({0}); using DEFAULT".format(e))
 				context.set_ciphers('DEFAULT:@SECLEVEL=1')
+
+			# TLS 1.3 suites use set_ciphersuites() when available
+			if getattr(self, 'tls_ciphersuites', None) and hasattr(context, 'set_ciphersuites'):
+				try:
+					context.set_ciphersuites(self.tls_ciphersuites)
+				except ssl.SSLError as e:
+					self.msg("set_ciphersuites failed: {0}".format(e))
 
 			if self.tls_verify:
 				context.verify_mode = ssl.CERT_REQUIRED
@@ -519,22 +504,12 @@ class NJE:
 				do_handshake_on_connect=False,
 			)
 
-			self.msg(
-				"Starting TLS handshake server_hostname={0!r} verify={1} "
-				"check_hostname={2} min={3} max={4}".format(
-					server_hostname, self.tls_verify, self.tls_check_hostname,
-					self.tls_min_version, self.tls_max_version,
-				)
-			)
+			self.msg("Starting TLS handshake (server_hostname={0!r})".format(server_hostname))
 			self.sock.do_handshake()
 			self.ssl = True
 			try:
-				cipher = self.sock.cipher()
-				version = self.sock.version()
-				self.msg("TLS upgrade successful: {0} {1}".format(version, cipher))
-				peercert = self.sock.getpeercert()
-				if peercert:
-					self.msg("Peer cert subject: {0}".format(peercert.get('subject')))
+				self.msg("TLS upgrade successful: {0} {1}".format(
+					self.sock.version(), self.sock.cipher()))
 			except Exception:
 				self.msg("TLS upgrade successful")
 			return True
@@ -724,14 +699,7 @@ class NJE:
 		self.sendData(with_TTB)
 
 	def send_I_record(self):
-		''' Creates Initial Signon Record 'I' '''
-		# From Page 111 in has2a620.pdf / IBM "Initial Signon Record"
-		# NCCIFLG bit X'40' (NCCIFLGS) means NJE *secure signon protocol*
-		# (APPCLU SESSKEY exchange) — NOT TLS. TLS is already done at the
-		# transport layer (OPEN SSL + AT-TLS). Setting X'40' without
-		# NODE SIGNON=SECURE + RACF APPCLU profiles causes:
-		#   $HASP500 SECURE SIGNON FAILURE, RC=21
-		# and an immediate type-B signoff.
+		'''Creates Initial Signon Record 'I' (see HAS2A620).'''
 		self.FCS = b"\x8F\xCF"
 		NCCRCB = b"\xF0" # Control Record
 		NCCSRCB = b"\xC9" # EBCDIC letter 'I'
@@ -740,16 +708,11 @@ class NJE:
 		NCCIREST = b"\x00\x64" # Node Resistance
 		BUFSIZE = b"\x80\x00" # Buffer Size. Set to: 32768
 		PASSWORD = self.padding(self.password)*2
-		# X'00' = normal initial signon; X'40' = request NJE secure signon (SESSKEY)
-		if getattr(self, 'nje_secure_signon', False):
-			NCCIFLG = b"\x40"
-			flag_note = "NCCIFLGS secure-signon x'40'"
-		else:
-			NCCIFLG = b"\x00"
-			flag_note = "normal x'00'"
+		# x'40' = NJE secure signon (SESSKEY), not TLS
+		NCCIFLG = b"\x40" if self.nje_secure_signon else b"\x00"
 		NCCIFEAT = b"\x15\x00\x00\x00"
 		p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
-		self.msg("Sending  >> Initial Signon Record type: I ({0})".format(flag_note))
+		self.msg("Sending  >> Initial Signon Record type: I")
 		self.sendNJE(NCCRCB, NCCSRCB, p)
 
 	def padding(self, word):
@@ -793,14 +756,7 @@ class NJE:
 		return self.hsize(TTR[2:4])
 
 	def getData(self):
-		"""Read currently available data from the socket.
-
-		Important: do NOT keep blocking in recv() until the peer closes.
-		The old loop did that (while buf != b'': recv), which after OPEN/ACK
-		left the client stuck waiting while JES2 expected a TLS ClientHello.
-		After ~10s AT-TLS timed out, reset the TCP session, and start_tls()
-		then failed with ENOTCONN.
-		"""
+		"""Read available data without blocking until peer close."""
 		if self.offline:
 			self.msg('Offline Mode: Not Retrieving data')
 			return b''
@@ -819,7 +775,6 @@ class NJE:
 			self.msg("Recieved << '' (timeout waiting for data)")
 			return b''
 
-		# Read first chunk (may block briefly up to socket timeout)
 		try:
 			buf = self.sock.recv(4096)
 		except socket.error as e:
@@ -830,7 +785,7 @@ class NJE:
 			return b''
 		data += buf
 
-		# Drain only what is already queued; do not block for more.
+		# Drain only data already queued
 		while True:
 			try:
 				r, _, _ = select([self.sock], [], [], 0)
@@ -843,7 +798,6 @@ class NJE:
 			except socket.error:
 				break
 			if buf == b'':
-				# Peer closed after delivering data we already have
 				break
 			data += buf
 
@@ -1084,7 +1038,6 @@ class NJE:
 		elif SRCB == "B":
 			self.msg("[NCCR] B - Signoff")
 			self.msg("Recieved Signoff Record of type 'B'. Closing Connection")
-			# Peer already signed off — just tear down the socket, don't send B again
 			self.signed_on = False
 			self.disconnect(clean=False)
 
