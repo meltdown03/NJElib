@@ -30,6 +30,9 @@
 #
 #########
 
+import atexit
+import os
+import signal
 import socket
 import inspect
 import sys
@@ -38,6 +41,7 @@ import re
 import struct
 import time
 import traceback
+import weakref
 from select import select
 import binascii
 from binascii import hexlify, unhexlify
@@ -49,6 +53,69 @@ SPACE = b'\x40'
 SYSIN = []
 SYSOUT = []
 NMR = []
+
+# Optional TLS 1.2 extras for z/OS AT-TLS (used only via addTLSCiphers())
+COMPAT_TLS_CIPHERS = (
+	'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:'
+	'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:'
+	'ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:'
+	'ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:'
+	'AES256-GCM-SHA384:AES128-GCM-SHA256:'
+	'AES256-SHA256:AES128-SHA256:'
+	'DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:'
+	'DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:'
+	'DHE-DSS-AES256-GCM-SHA384:DHE-DSS-AES128-GCM-SHA256:'
+	'DHE-DSS-AES256-SHA256:DHE-DSS-AES128-SHA256:'
+	'@SECLEVEL=1'
+)
+
+# Active sessions cleaned up on interpreter exit / SIGINT / SIGTERM
+_active_sessions = weakref.WeakSet()
+_exit_hooks_installed = False
+
+
+def _cleanup_active_sessions():
+	for nje in list(_active_sessions):
+		try:
+			if (
+				getattr(nje, 'sock', None)
+				or getattr(nje, 'connected', False)
+				or getattr(nje, 'signed_on', False)
+			):
+				nje.disconnect(clean=True)
+		except Exception:
+			pass
+
+
+def _install_exit_hooks():
+	global _exit_hooks_installed
+	if _exit_hooks_installed:
+		return
+	_exit_hooks_installed = True
+	atexit.register(_cleanup_active_sessions)
+
+	def _on_signal(signum, frame):
+		_cleanup_active_sessions()
+		signal.signal(signum, signal.SIG_DFL)
+		os.kill(os.getpid(), signum)
+
+	for sig in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):
+		if sig is None:
+			continue
+		try:
+			signal.signal(sig, _on_signal)
+		except (ValueError, OSError):
+			# Not the main thread, or signals unavailable
+			pass
+
+
+def _register_session(nje):
+	_install_exit_hooks()
+	_active_sessions.add(nje)
+
+
+def _unregister_session(nje):
+	_active_sessions.discard(nje)
 
 def my_to_bytes(a):
 		# print("-->my_to_bytes",type(a))
@@ -89,27 +156,7 @@ class NJE:
 		self.tls_verify = True
 		self.tls_check_hostname = True
 		self.tls_server_hostname = None
-		self.tls_min_version = ssl.TLSVersion.TLSv1_2
-		self.tls_max_version = ssl.TLSVersion.TLSv1_3
-		# TLS 1.2 cipher list (set_ciphers). TLS 1.3 suites are separate.
-		self.tls_ciphers = (
-			'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:'
-			'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:'
-			'ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:'
-			'ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:'
-			'AES256-GCM-SHA384:AES128-GCM-SHA256:'
-			'AES256-SHA256:AES128-SHA256:'
-			'DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:'
-			'DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:'
-			'DHE-DSS-AES256-GCM-SHA384:DHE-DSS-AES128-GCM-SHA256:'
-			'DHE-DSS-AES256-SHA256:DHE-DSS-AES128-SHA256:'
-			'@SECLEVEL=1'
-		)
-		self.tls_ciphersuites = (
-			'TLS_AES_128_GCM_SHA256:'
-			'TLS_AES_256_GCM_SHA384:'
-			'TLS_CHACHA20_POLY1305_SHA256'
-		)
+		self.tls_extra_ciphers = None  # set by addTLSCiphers() if needed
 		self.tls_after_open_delay = 0.2
 		#self.OIP	 = socket.inet_aton(host)
 		self.R		= b'\x00'
@@ -122,6 +169,9 @@ class NJE:
 		self.use_tls_after_open = False  # enabled by setTLS()
 		self.nje_secure_signon = False   # NCCIFLG x'40' / APPCLU SESSKEY
 		self.signed_on = False
+		self.last_activity = 0.0
+		# If idle longer than this (seconds), send an NJE heartbeat before next send
+		self.idle_heartbeat = 60.0
 		if host:
 			self.signon(self.host, self.port)
 
@@ -141,8 +191,11 @@ class NJE:
 				print("Connecting (non-TLS)")
 			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 			sock.settimeout(timeout)
+			# Help detect dead peers; does not replace NJE-level heartbeats
+			sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 			sock.connect((host, port))
 			self.sock = sock
+			self.last_activity = time.time()
 			return True
 		except Exception as e:
 			self.msg("Plain Connection Failed: {0}".format(e))
@@ -169,6 +222,7 @@ class NJE:
 		self.signed_on = False
 		self.sequence = 0x80
 		self.sock = None
+		_unregister_session(self)
 
 		if not sock:
 			return
@@ -269,7 +323,8 @@ class NJE:
 
 	def INC_SEQUENCE(self):
 		prev = self.sequence
-		self.sequence = (self.sequence & 0x0F)+1|0x80
+		# BCB sequence is 4 bits under 0x80; must wrap 0x8F -> 0x80 (not 0x90)
+		self.sequence = ((self.sequence & 0x0F) + 1) & 0x0F | 0x80
 		self.msg("Incremented sequence number from {0} to {1}".format(prev, self.sequence))
 
 	def changeNode(self, node):
@@ -424,14 +479,16 @@ class NJE:
 		self.msg("Own Node   : " + self.phex(self.own_node))
 		self.msg("Dest Node  : " + self.phex(self.target_node))
 		self.signed_on = True
+		_register_session(self)
 		return True
 	def setTLS(self, certfile=None, cafile=None, keyfile=None, password=None,
 			   verify=True, check_hostname=True, server_hostname=None,
-			   after_open_delay=None, ciphers=None, ciphersuites=None):
+			   after_open_delay=None):
 		"""Enable TLS (OPEN SSL + upgrade after OPEN/ACK).
 
-		cafile trusts the server cert. certfile/keyfile are optional client certs.
-		ciphers is the TLS 1.2 list; ciphersuites is the TLS 1.3 list.
+		Uses ssl.create_default_context(). cafile trusts the server cert;
+		certfile/keyfile are optional client certs. Call addTLSCiphers() if the
+		peer needs extra suites beyond the OpenSSL defaults.
 		"""
 		self.cafile = cafile
 		self.certfile = certfile
@@ -442,13 +499,19 @@ class NJE:
 		self.tls_server_hostname = server_hostname
 		if after_open_delay is not None:
 			self.tls_after_open_delay = after_open_delay
-		if ciphers is not None:
-			self.tls_ciphers = ciphers
-		if ciphersuites is not None:
-			self.tls_ciphersuites = ciphersuites
 		self.use_tls_after_open = True
 		self.TYPE = self.padding("OPEN SSL")
 		return
+
+	def addTLSCiphers(self, ciphers=None):
+		"""Add extra TLS 1.2 ciphers for mainframe interoperability.
+
+		With no argument, uses COMPAT_TLS_CIPHERS. Pass a colon-separated
+		OpenSSL cipher string to use a custom list instead. Merged with
+		DEFAULT at handshake time (does not replace secure defaults alone).
+		"""
+		self.tls_extra_ciphers = COMPAT_TLS_CIPHERS if ciphers is None else ciphers
+		return self
 
 	def start_tls(self):
 		if self.ssl:
@@ -463,31 +526,21 @@ class NJE:
 			except OSError as e:
 				raise OSError("TCP socket not connected before TLS ({0})".format(e))
 
-			context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-			context.minimum_version = self.tls_min_version
-			context.maximum_version = self.tls_max_version
-			try:
-				context.set_ciphers(self.tls_ciphers)
-			except ssl.SSLError as e:
-				self.msg("Cipher list rejected ({0}); using DEFAULT".format(e))
-				context.set_ciphers('DEFAULT:@SECLEVEL=1')
-
-			# TLS 1.3 suites use set_ciphersuites() when available
-			if getattr(self, 'tls_ciphersuites', None) and hasattr(context, 'set_ciphersuites'):
-				try:
-					context.set_ciphersuites(self.tls_ciphersuites)
-				except ssl.SSLError as e:
-					self.msg("set_ciphersuites failed: {0}".format(e))
-
 			if self.tls_verify:
-				context.verify_mode = ssl.CERT_REQUIRED
-				if self.cafile:
-					context.load_verify_locations(cafile=self.cafile)
-				else:
-					context.load_default_certs()
+				context = ssl.create_default_context(cafile=self.cafile)
+				context.check_hostname = self.tls_check_hostname
 			else:
+				context = ssl.create_default_context()
+				context.check_hostname = False
 				context.verify_mode = ssl.CERT_NONE
-			context.check_hostname = self.tls_check_hostname
+
+			if self.tls_extra_ciphers:
+				try:
+					# Keep DEFAULT suites, prepend/append extras for AT-TLS peers
+					context.set_ciphers(self.tls_extra_ciphers + ':DEFAULT')
+					self.msg("Using extra TLS ciphers plus DEFAULT")
+				except ssl.SSLError as e:
+					self.msg("Extra ciphers rejected ({0}); keeping defaults".format(e))
 
 			if self.certfile:
 				self.msg("Loading client certificate: {0}".format(self.certfile))
@@ -673,11 +726,14 @@ class NJE:
 		self.msg("Sent {0} NJE Records".format(len(records)))
 
 	def sendHeartbeat(self):
-		self.msg("Sending Hearbeat Request Reply")
-#		BCB  = self.sequence.to_bytes(1,"big")
-		BCB  = my_to_bytes(self.sequence)
-		self.sendData(b"\x00\x00\x00\x16\x00\x00\x00\x00\x00\x00\x00\x06\x10\x02" +
-					  BCB + self.FCS + b"00\x00\x00\x00\x00")
+		"""Reply to a peer keep-alive (TTR length 6: DLE STX BCB FCS 00)."""
+		self.msg("Sending Heartbeat Reply")
+		if not self.FCS:
+			self.FCS = b"\x8F\xCF"
+		BCB = my_to_bytes(self.sequence)
+		# Must be null bytes — b"00" is ASCII '0' (0x30) and poisons the link
+		record = b"\x10\x02" + BCB + self.FCS + b"\x00"
+		self.sendData(self.makeTTB(self.makeTTR(record)))
 		self.INC_SEQUENCE()
 
 	def check_signoff(self, buf):
@@ -755,8 +811,11 @@ class NJE:
 		''' returns an int of the length '''
 		return self.hsize(TTR[2:4])
 
-	def getData(self):
-		"""Read available data without blocking until peer close."""
+	def getData(self, timeout=None):
+		"""Read available data without blocking until peer close.
+
+		timeout: seconds to wait for first byte (default: self.timeout).
+		"""
 		if self.offline:
 			self.msg('Offline Mode: Not Retrieving data')
 			return b''
@@ -765,7 +824,8 @@ class NJE:
 			return b''
 
 		data = b''
-		timeout = getattr(self, 'timeout', 30) or 30
+		if timeout is None:
+			timeout = getattr(self, 'timeout', 30) or 30
 		try:
 			r, _, _ = select([self.sock], [], [], timeout)
 		except (TypeError, ValueError) as e:
@@ -779,9 +839,13 @@ class NJE:
 			buf = self.sock.recv(4096)
 		except socket.error as e:
 			self.msg("getData recv failed: {0}".format(e))
+			self.connected = False
+			self.signed_on = False
 			return b''
 		if buf == b'':
 			self.msg("Recieved << '' (peer closed)")
+			self.connected = False
+			self.signed_on = False
 			return b''
 		data += buf
 
@@ -798,11 +862,51 @@ class NJE:
 			except socket.error:
 				break
 			if buf == b'':
+				self.connected = False
+				self.signed_on = False
 				break
 			data += buf
 
+		self.last_activity = time.time()
 		self.msg("Recieved << '{0}'".format(self.phex(data)))
 		return data
+
+	def _process_inbound(self, timeout=None):
+		"""Read one batch and run process_RCB. Returns True if any data arrived."""
+		data = self.getData(timeout=timeout)
+		if not data:
+			return False
+		self.records = self.processData(data)
+		self.process_RCB()
+		return True
+
+	def _drain_inbound(self, idle=0.15, max_rounds=20):
+		"""Process any pending inbound NJE until the socket is quiet."""
+		for _ in range(max_rounds):
+			if not self.connected or not self.sock:
+				break
+			if not self._process_inbound(timeout=idle):
+				break
+
+	def _ensure_session(self):
+		"""Drain inbound traffic and send a heartbeat if the link was idle."""
+		if not self.sock or not self.connected or not self.signed_on:
+			return False
+		self._drain_inbound()
+		if not self.connected:
+			return False
+		idle = time.time() - (self.last_activity or 0)
+		if self.idle_heartbeat and idle >= self.idle_heartbeat:
+			self.msg("Idle {0:.0f}s; sending NJE heartbeat".format(idle))
+			try:
+				self.sendHeartbeat()
+				self._drain_inbound(idle=0.5, max_rounds=10)
+			except Exception as e:
+				self.msg("Heartbeat failed: {0}".format(e))
+				self.connected = False
+				self.signed_on = False
+				return False
+		return bool(self.connected and self.sock)
 
 	def sendData(self, data):
 		"""Sends raw data to the NJE server """
@@ -812,7 +916,14 @@ class NJE:
 		if self.offline:
 			self.msg('Offline Mode: Not Sending data')
 			return
-		self.sock.sendall(data)
+		try:
+			self.sock.sendall(data)
+			self.last_activity = time.time()
+		except OSError as e:
+			self.msg("sendData failed: {0}".format(e))
+			self.connected = False
+			self.signed_on = False
+			raise
 
 	def processData(self, data):
 		"""Process Data Streams returns an array """
@@ -942,7 +1053,7 @@ class NJE:
 
 			if RCB == 0x00:
 				self.msg("End-of-block (BSC) (00)")
-				return "EOB"
+				continue
 			elif RCB == 0x90:
 				self.msg("Type: Request to initiate stream (90)")
 				record['stream'] = record['SRCB']
@@ -951,12 +1062,13 @@ class NJE:
 				RCB = b"\xA0"
 				SRCB = record['stream']
 				self.sendNJE(RCB, SRCB, b"\x00\x00")
-				return
+				continue
 			elif RCB == 0xA0:
 				self.msg("Type: Permission to initiate stream (A0)")
 				record['streaming'] = True
 
 			elif RCB == 0xB0:
+				# Stream-level cancel/deny (SRCB = stream), not full session death
 				self.msg("Type: Negative permission or receiver cancel (B0)")
 			elif RCB == 0xC0:
 				self.msg("Type: Acknowledge transmission complete (C0)")
@@ -1856,19 +1968,53 @@ class NJE:
 		time.sleep(5)
 #		self.signoff()
 
-	def sendCommand(self, command):
-		""" uses 'command' to create a node message record (NMR) and sends it """
+	def sendCommand(self, command, clear=True, wait=5.0):
+		"""Send an operator command (NMR) and return the reply text.
+
+		clear=True (default) drops previous NMR replies so only this command's
+		responses are returned. Pass clear=False to keep and include history.
+		wait: seconds to collect replies (multi-packet responses).
+
+		If the session sat idle, a heartbeat is sent first (see idle_heartbeat).
+		Long idle links are often dropped by JES2/AT-TLS/TCP — reconnect if
+		this returns False with a dead session.
+		"""
 		self.msg("Sending command: {0}".format(command))
-		self.sendNMR(command, True)
-		self.records = self.processData(self.getData())
-		self.process_RCB()
+		if not self._ensure_session():
+			self.msg("Session not alive (idle timeout or peer closed); reconnect")
+			return False
+		if clear:
+			NMR.clear()
+		try:
+			self.sendNMR(command, True)
+		except OSError as e:
+			self.msg("sendCommand send failed: {0}".format(e))
+			return False
+
+		# Collect replies; keep draining briefly after the first NMR arrives
+		# so multi-line console output is not left sitting for the next call.
+		deadline = time.time() + wait
+		got_reply = False
+		while time.time() < deadline:
+			if not self.connected:
+				break
+			timeout = min(0.5, max(0.05, deadline - time.time()))
+			if not self._process_inbound(timeout=timeout):
+				if got_reply:
+					break
+				continue
+			if NMR:
+				got_reply = True
+				# short quiet period for trailing lines, then stop
+				self._drain_inbound(idle=0.25, max_rounds=5)
+				break
+
 		message = ''
 		for record in self.getNMR():
 			for i in record:
 				self.msg("record[{0}]: {1}".format(i, record[i]))
 			if 'NMRMSG' in record:
 				message += record['NMRMSG'].decode('ascii') + "\n"
-#		self.signoff()
 		if len(message) <= 0:
 			return False
 		else:
