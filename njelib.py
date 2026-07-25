@@ -46,6 +46,8 @@ from select import select
 import binascii
 from binascii import hexlify, unhexlify
 from bitstring import BitStream, BitArray
+import secrets
+from Crypto.Cipher import DES3
 
 DEBUGLEVEL = 0
 NJE_PORT = 175
@@ -136,7 +138,7 @@ def my_from_bytes(a):
 			print("--->my_from_bytes unsupported type",type(a))
 
 class NJE:
-	def __init__(self, rhost='', ohost='', host='', port=0, password='', rip='127.0.0.1'):
+	def __init__(self, rhost='', ohost='', host='', port=0, password='', rip='127.0.0.1', sesskey=None):
 		self.debuglevel = DEBUGLEVEL
 		self.host	= host
 		self.port	= port
@@ -167,7 +169,11 @@ class NJE:
 		self.sequence	= 0x80
 		#self.sequence	= b'\x80'
 		self.use_tls_after_open = False  # enabled by setTLS()
-		self.nje_secure_signon = False   # NCCIFLG x'40' / APPCLU SESSKEY
+		self.sesskey = sesskey  # Session key for secure signon (8-24 bytes)
+		self.nje_secure_signon = bool(sesskey)  # Auto-enable if sesskey provided
+		self.secure_signon_s1 = None     # Random string sent in I record
+		self.secure_signon_s2 = None     # Random string for secondary validation
+		self.secure_signon_verified = False  # Track if remote verified our s1
 		self.signed_on = False
 		self.last_activity = 0.0
 		# If idle longer than this (seconds), send an NJE heartbeat before next send
@@ -759,7 +765,6 @@ class NJE:
 		self.FCS = b"\x8F\xCF"
 		NCCRCB = b"\xF0" # Control Record
 		NCCSRCB = b"\xC9" # EBCDIC letter 'I'
-		LEN = b"\x29" # LENGTH OF RECORD
 		NCCIEVNT = b"\x00" * 4
 		NCCIREST = b"\x00\x64" # Node Resistance
 		BUFSIZE = b"\x80\x00" # Buffer Size. Set to: 32768
@@ -767,8 +772,20 @@ class NJE:
 		# x'40' = NJE secure signon (SESSKEY), not TLS
 		NCCIFLG = b"\x40" if self.nje_secure_signon else b"\x00"
 		NCCIFEAT = b"\x15\x00\x00\x00"
-		p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
-		self.msg("Sending  >> Initial Signon Record type: I")
+		
+		if self.nje_secure_signon:
+			# Generate random 8-byte string s1 for secure signon
+			self.secure_signon_s1 = self._generate_random_8bytes()
+			self.msg("Secure signon: sending s1 = {0}".format(hexlify(self.secure_signon_s1)))
+			# For secure signon, record length is 0x31 (49 bytes) with NCCIPRAW
+			LEN = b"\x31"
+			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + self.secure_signon_s1 + NCCIFLG + NCCIFEAT
+		else:
+			# Regular signon, record length is 0x29 (41 bytes)
+			LEN = b"\x29"
+			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
+		
+		self.msg("Sending  >> Initial Signon Record type: I (secure={0})".format(self.nje_secure_signon))
 		self.sendNJE(NCCRCB, NCCSRCB, p)
 
 	def padding(self, word):
@@ -776,6 +793,45 @@ class NJE:
 		pad=(SPACE * (8-len(word)))
 		x=self.AsciiToEbcdic(word.upper())
 		return(x+pad)
+
+	def _derive_des_key(self, password):
+		"""Derive an 8-byte DES key from sesskey or password (z/OS uses single DES)"""
+		# If explicit session key provided, use it
+		if hasattr(self, 'sesskey') and self.sesskey:
+			sesskey_str = self.sesskey if isinstance(self.sesskey, str) else self.sesskey.decode('ascii')
+			# Convert to EBCDIC and pad to 8 bytes
+			sesskey_ebcdic = self.AsciiToEbcdic(sesskey_str.upper())
+			sesskey_8bytes = sesskey_ebcdic + (SPACE * (8 - len(sesskey_ebcdic)))
+			return sesskey_8bytes[:8]
+		
+		# Otherwise use password - pad to 8 bytes
+		pwd_str = password if isinstance(password, str) else password.decode('ascii')
+		pwd_ebcdic = self.AsciiToEbcdic(pwd_str.upper())
+		pwd_8bytes = pwd_ebcdic + (SPACE * (8 - len(pwd_ebcdic)))
+		return pwd_8bytes[:8]
+
+	def _des3_encrypt(self, plaintext, key=None):
+		"""Encrypt plaintext using DES ECB mode"""
+		if key is None:
+			key = self._derive_des_key(self.password)
+		# Use only first 8 bytes for single DES (z/OS uses single DES for secure signon)
+		from Crypto.Cipher import DES
+		cipher = DES.new(key[:8], DES.MODE_ECB)
+		return cipher.encrypt(plaintext)
+
+	def _des3_decrypt(self, ciphertext, key=None):
+		"""Decrypt ciphertext using DES ECB mode"""
+		if key is None:
+			key = self._derive_des_key(self.password)
+		# Use only first 8 bytes for single DES (z/OS uses single DES for secure signon)
+		from Crypto.Cipher import DES
+		cipher = DES.new(key[:8], DES.MODE_ECB)
+		return cipher.decrypt(ciphertext)
+
+	def _generate_random_8bytes(self):
+		"""Generate a random 8-byte string for secure signon"""
+		return secrets.token_bytes(8)
+
 
 	def hsize(self, b_array):
 		return struct.unpack('>H', b_array)[0]
@@ -1121,12 +1177,41 @@ class NJE:
 			record['NCCIEVNT'] = record['Data'][10:14]
 			record['NCCIREST'] = record['Data'][14:16]
 			record['NCCIBUFSZ'] = record['Data'][16:18]
-			record['NCCILPAS'] = self.EbcdicToAscii(record['Data'][18:26])
-			record['NCCINPAS'] = self.EbcdicToAscii(record['Data'][26:34])
-			#record['NCCIPRAW'] = record['Data'][28:32]
-			#record['NCCIPENC'] = record['Data'][32:40]
-			record['NCCIFLG'] = record['Data'][34]
-			record['NCCIFEAT'] = record['Data'][45:]
+			
+			# Handle secure vs regular signon fields
+			if self.nje_secure_signon:
+				self.msg("Processing secure signon response (J record)")
+				# In secure signon mode:
+				# Data[18:26]: NCCIPRAW (s2 from remote)
+				# Data[26:34]: NCCIPENC (encrypted s1 from remote)
+				record['NCCIPRAW'] = record['Data'][18:26]
+				record['NCCIPENC'] = record['Data'][26:34]
+				self.msg("Secure signon: received s2 = {0}".format(hexlify(record['NCCIPRAW'])))
+				self.msg("Secure signon: received e_s1 = {0}".format(hexlify(record['NCCIPENC'])))
+				
+				# Verify remote encrypted our s1 correctly
+				try:
+					my_encrypted_s1 = self._des3_encrypt(self.secure_signon_s1)
+					if my_encrypted_s1 == record['NCCIPENC']:
+						self.msg("Secure signon: s1 verification SUCCESS")
+						self.secure_signon_verified = True
+					else:
+						self.msg("Secure signon: s1 verification FAILED - remote response doesn't match")
+						self.msg("Expected: {0}".format(hexlify(my_encrypted_s1)))
+						self.msg("Got: {0}".format(hexlify(record['NCCIPENC'])))
+				except Exception as e:
+					self.msg("Secure signon: s1 verification ERROR - {0}".format(e))
+				
+				# Store s2 for later verification in K/L record
+				self.secure_signon_s2 = record['NCCIPRAW']
+				record['NCCIFLG'] = record['Data'][34]
+			else:
+				# Regular signon mode - use password fields
+				record['NCCILPAS'] = self.EbcdicToAscii(record['Data'][18:26])
+				record['NCCINPAS'] = self.EbcdicToAscii(record['Data'][26:34])
+				record['NCCIFLG'] = record['Data'][34]
+			
+			record['NCCIFEAT'] = record['Data'][45:] if len(record['Data']) > 45 else b''
 			self.target_node = record['NCCIQUAL']
 			record['Data'] = ''
 			if record['NCCIEVNT'] == b"\x00\x00\x00\x00":
@@ -1141,8 +1226,36 @@ class NJE:
 
 		elif SRCB == "K":
 			self.msg("[NCCR] K - Reset signon")
+			if self.nje_secure_signon and len(record['Data']) >= 8:
+				# Extract encrypted s2 from K record
+				received_e_s2 = record['Data'][-8:]
+				try:
+					my_encrypted_s2 = self._des3_encrypt(self.secure_signon_s2) if self.secure_signon_s2 else None
+					if my_encrypted_s2 and my_encrypted_s2 == received_e_s2:
+						self.msg("Secure signon: s2 verification SUCCESS")
+					else:
+						self.msg("Secure signon: s2 verification FAILED")
+						if my_encrypted_s2:
+							self.msg("Expected: {0}".format(hexlify(my_encrypted_s2)))
+							self.msg("Got: {0}".format(hexlify(received_e_s2)))
+				except Exception as e:
+					self.msg("Secure signon: s2 verification ERROR - {0}".format(e))
 		elif SRCB == "L":
 			self.msg("[NCCR] L - Concurrence signon")
+			if self.nje_secure_signon and len(record['Data']) >= 8:
+				# Extract encrypted s2 from L record
+				received_e_s2 = record['Data'][-8:]
+				try:
+					my_encrypted_s2 = self._des3_encrypt(self.secure_signon_s2) if self.secure_signon_s2 else None
+					if my_encrypted_s2 and my_encrypted_s2 == received_e_s2:
+						self.msg("Secure signon: s2 verification SUCCESS")
+					else:
+						self.msg("Secure signon: s2 verification FAILED")
+						if my_encrypted_s2:
+							self.msg("Expected: {0}".format(hexlify(my_encrypted_s2)))
+							self.msg("Got: {0}".format(hexlify(received_e_s2)))
+				except Exception as e:
+					self.msg("Secure signon: s2 verification ERROR - {0}".format(e))
 		elif SRCB == "M":
 			self.msg("[NCCR] M - Add connection")
 		elif SRCB == "N":
@@ -1158,20 +1271,42 @@ class NJE:
 		RCB = b"\xF0"	 #NCCRCB type 0xF0
 		SRCB = b"\xD2"	  #SRCB = 'K'
 		LEN = b"\x09"
-		reset = LEN + b"\xFF\xFF\xFF\xFF" + b"\x00\xC8" + b"\x00\x00\x00\x00"
+		
+		if self.nje_secure_signon and self.secure_signon_s2:
+			# For secure signon K record, include encrypted s2
+			try:
+				encrypted_s2 = self._des3_encrypt(self.secure_signon_s2)
+				self.msg("Secure signon: sending e_s2 = {0}".format(hexlify(encrypted_s2)))
+				reset = LEN + b"\xFF\xFF\xFF\xFF" + b"\x00\xC8" + encrypted_s2
+			except Exception as e:
+				self.msg("Secure signon: failed to encrypt s2 - {0}".format(e))
+				reset = LEN + b"\xFF\xFF\xFF\xFF" + b"\x00\xC8" + b"\x00\x00\x00\x00"
+		else:
+			reset = LEN + b"\xFF\xFF\xFF\xFF" + b"\x00\xC8" + b"\x00\x00\x00\x00"
+		
 		self.msg("Sending  >> Reset Signon Record type: K")
 		self.sendNJE(RCB, SRCB, reset)
-		#self.sendData(self.makeTTB(self.makeTTR_dbh(reset_signon)))
 
 	def send_concurrence(self, NCCIEVNT):
 		''' Builds concurrence Signon Record '''
 		RCB = b"\xF0"	 #NCCRCB type 0xF0
 		SRCB = b"\xD3"	  #SRCB = 'L'
 		LEN = b"\x09"
-		con = LEN + NCCIEVNT + b"\x00\xC8"
+		
+		if self.nje_secure_signon and self.secure_signon_s2:
+			# For secure signon L record, include encrypted s2
+			try:
+				encrypted_s2 = self._des3_encrypt(self.secure_signon_s2)
+				self.msg("Secure signon: sending e_s2 = {0}".format(hexlify(encrypted_s2)))
+				con = LEN + NCCIEVNT + b"\x00\xC8" + encrypted_s2
+			except Exception as e:
+				self.msg("Secure signon: failed to encrypt s2 - {0}".format(e))
+				con = LEN + NCCIEVNT + b"\x00\xC8"
+		else:
+			con = LEN + NCCIEVNT + b"\x00\xC8"
+		
 		self.msg("Sending  >> Accept (concurrence) network SIGNON Record type: L")
 		self.sendNJE(RCB, SRCB, con)
-		#self.sendData(self.makeTTB(self.makeTTR_dbh(concurrent_signon)))
 
 	def request_stream(self):
 		""" Requests to initiate an NJE stream """
