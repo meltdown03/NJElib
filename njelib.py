@@ -763,6 +763,7 @@ class NJE:
 	def send_I_record(self):
 		'''Creates Initial Signon Record 'I' (see HAS2A620).'''
 		self.FCS = b"\x8F\xCF"
+		LEN = b"\x29"
 		NCCRCB = b"\xF0" # Control Record
 		NCCSRCB = b"\xC9" # EBCDIC letter 'I'
 		NCCIEVNT = b"\x00" * 4
@@ -777,12 +778,9 @@ class NJE:
 			# Generate random 8-byte string s1 for secure signon
 			self.secure_signon_s1 = self._generate_random_8bytes()
 			self.msg("Secure signon: sending s1 = {0}".format(hexlify(self.secure_signon_s1)))
-			# For secure signon, record length is 0x31 (49 bytes) with NCCIPRAW
-			LEN = b"\x31"
-			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + self.secure_signon_s1 + NCCIFLG + NCCIFEAT
+			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + self.secure_signon_s1 + NCCIFLG + NCCIFEAT
 		else:
 			# Regular signon, record length is 0x29 (41 bytes)
-			LEN = b"\x29"
 			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
 		
 		self.msg("Sending  >> Initial Signon Record type: I (secure={0})".format(self.nje_secure_signon))
