@@ -812,7 +812,7 @@ class NJE:
 		Accepted forms:
 		  * bytes/bytearray of length 8: already-encoded raw key bytes
 		  * 16 hexadecimal digits: for example D7C1E2E2E6D9C4F1
-		  * up to 8 text characters: uppercased, encoded as EBCDIC, blank padded
+		  * up to 8 text characters: uppercased, encoded as EBCDIC, zero padded
 		"""
 		if isinstance(sesskey, (bytes, bytearray, memoryview)):
 			raw = bytes(sesskey)
@@ -846,7 +846,10 @@ class NJE:
 				"text sesskey is longer than 8 characters; pass 16 hex digits for raw bytes"
 			)
 
-		return self.AsciiToEbcdic(ascii_text) + (SPACE * (8 - len(ascii_text)))
+		# JES2 initializes MDCTIKEY to binary zeros before copying the
+		# extracted SESSKEY.  A short text key therefore has X'00' bytes,
+		# not EBCDIC blanks, in the unused right-hand positions.
+		return self.AsciiToEbcdic(ascii_text) + (b"\x00" * (8 - len(ascii_text)))
 
 	@staticmethod
 	def _racf_des_key_from_challenge(challenge):
@@ -959,16 +962,13 @@ class NJE:
 		return candidate.to_bytes(4, "big")
 
 	def _derive_des_key(self, password):
-		"""Derive an 8-byte DES key from sesskey or password (z/OS uses single DES)"""
-		# If explicit session key provided, use it
-		if hasattr(self, 'sesskey') and self.sesskey:
-			sesskey_str = self.sesskey if isinstance(self.sesskey, str) else self.sesskey.decode('ascii')
-			# Convert to EBCDIC and pad to 8 bytes
-			sesskey_ebcdic = self.AsciiToEbcdic(sesskey_str.upper())
-			sesskey_8bytes = sesskey_ebcdic + (SPACE * (8 - len(sesskey_ebcdic)))
-			return sesskey_8bytes[:8]
+		"""Derive an 8-byte DES key from sesskey or password (z/OS uses single DES)."""
+		# Reuse the canonical SESSKEY normalization.  In particular, short
+		# SESSKEY values are right-padded with X'00', matching JES2.
+		if self._secure_signon_session_key is not None:
+			return self._secure_signon_session_key
 		
-		# Otherwise use password - pad to 8 bytes
+		# Ordinary NJE password fields remain EBCDIC-blank padded.
 		pwd_str = password if isinstance(password, str) else password.decode('ascii')
 		pwd_ebcdic = self.AsciiToEbcdic(pwd_str.upper())
 		pwd_8bytes = pwd_ebcdic + (SPACE * (8 - len(pwd_ebcdic)))
