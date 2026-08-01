@@ -42,6 +42,7 @@ import struct
 import time
 import traceback
 import weakref
+import tempfile
 from select import select
 import binascii
 from binascii import hexlify, unhexlify
@@ -183,6 +184,16 @@ class NJE:
 		self._last_connection_event = 0
 		self.signed_on = False
 		self.last_activity = 0.0
+		# RCBs of inbound streams whose EOF has been acknowledged.  This is
+		# also used to distinguish "some SYSOUT arrived" from a fully received
+		# SYSOUT job.
+		self._completed_inbound_streams = []
+		self._inbound_sysout_jobs = {}
+		self._completed_sysout_jobs = []
+		# NJHGJID identifies a job at its originating node.  Do not reuse the
+		# old hard-coded value (49), because more than one NJEUPLD output can be
+		# in flight on different SYSOUT streams.
+		self._next_nje_job_number = secrets.randbelow(32767) + 1
 		# If idle longer than this (seconds), send an NJE heartbeat before next send
 		self.idle_heartbeat = 60.0
 		if host:
@@ -1315,12 +1326,55 @@ class NJE:
 				NMR.append(data)
 			elif (RCB & 0x0F) == 0x08:
 				self.msg("Type: SYSIN record (98-F8)")
+				if record['SRCB'] == b"\x00":
+					self._acknowledge_stream_eof(record['RCB'])
+					continue
 				data = self.process_SYSIN(record)
 				SYSIN.append(data)
 			elif (RCB & 0x0F) == 0x09:
 				self.msg("Type: SYSOUT record (99-F9)")
+				if record['SRCB'] == b"\x00":
+					self._acknowledge_stream_eof(record['RCB'])
+					continue
 				data = self.process_SYSOUT(record)
 				SYSOUT.append(data)
+				if data and 'NJHGJID' in data:
+					self._inbound_sysout_jobs[record['RCB']] = data
+
+	def _acknowledge_stream_eof(self, stream_rcb):
+		"""Acknowledge a received SYSIN/SYSOUT EOF and close that stream."""
+		self.msg(
+			"End of stream X'{0:02X}'; sending transmission complete".format(
+				my_from_bytes(stream_rcb)
+			)
+		)
+		# For a stream-control record, SRCB identifies the completed stream.
+		self.sendNJE(b"\xC0", stream_rcb, b"\x00\x00")
+		self._completed_inbound_streams.append(stream_rcb)
+		if (my_from_bytes(stream_rcb) & 0x0F) == 0x09:
+			self._completed_sysout_jobs.append(
+				self._inbound_sysout_jobs.pop(stream_rcb, None)
+			)
+
+	def _completed_sysout_count(self):
+		"""Return the number of inbound SYSOUT streams acknowledged so far."""
+		return sum(
+			1 for stream in self._completed_inbound_streams
+			if (my_from_bytes(stream) & 0x0F) == 0x09
+		)
+
+	def _sysout_job_completed_since(self, job_number, job_name, start_index):
+		"""Return true when the selected NJE job has reached SYSOUT EOF."""
+		expected_name = str(job_name).strip().upper()
+		for job in self._completed_sysout_jobs[start_index:]:
+			if not job or job.get('NJHGJID') != job_number:
+				continue
+			actual_name = job.get('NJHGJNAM', b'')
+			if isinstance(actual_name, bytes):
+				actual_name = actual_name.decode('ascii', errors='replace')
+			if actual_name.strip().upper() == expected_name:
+				return True
+		return False
 
 	def process_NCCR(self, record):
 		""" Networking Connection Control Records (NCCR)
@@ -2348,9 +2402,10 @@ class NJE:
 		else:
 			return message
 
-	def sendJCL(self, filename, userid='ibmuser', group='sys1'):
-		""" sends JCL file as user """
+	def sendJCL(self, filename, userid='ibmuser', group='sys1', wait_for_sysout=True):
+		"""Send a JCL file, optionally waiting for a complete SYSOUT stream."""
 		self.msg("Processing JCL file")
+		completed_jobs_before = len(self._completed_sysout_jobs)
 
 		with open (filename, "r") as myfile:
 			data=myfile.readlines()
@@ -2378,9 +2433,14 @@ class NJE:
 		self.msg("Group: {0}".format(group))
 
 		jcl = []
-		jcl.append(data[0].strip("\n") + " " * (72 - len(data[0].strip("\n"))) + "JOB00049" )
+		num = self._next_nje_job_number
+		self._next_nje_job_number = 1 if num >= 32767 else num + 1
+		jcl.append(
+			data[0].strip("\n")
+			+ " " * (72 - len(data[0].strip("\n")))
+			+ "JOB{0:05d}".format(num)
+		)
 		jcl += data[1:]
-		num = int(jcl[0][-5:])
 		self.msg("Job Number: {0}".format(num))
 		jcl_class = "A"
 		msg_class = "K"
@@ -2404,10 +2464,163 @@ class NJE:
 		self.records = self.processData(self.getData())
 		self.process_RCB()
 
-		while len(self.getSYSOUT()) <= 0:
-			self.records = self.processData(self.getData())
-			self.process_RCB()
+		if wait_for_sysout:
+			while not self._sysout_job_completed_since(
+				num, job, completed_jobs_before
+			):
+				self.records = self.processData(self.getData())
+				self.process_RCB()
+				if not self.connected:
+					raise ConnectionError(
+						"NJE peer disconnected while waiting for complete SYSOUT"
+					)
 #		self.signoff()
+
+	def upload_text(self, local_path, dataset, userid='ibmuser', group='sys1',
+			create=False, recfm='FB', lrecl=80, blksize=0,
+			primary=5, secondary=5, unit='SYSDA', long_lines='error',
+			wait_for_sysout=True):
+		"""Upload an ASCII text file through NJE using an IEBGENER job.
+
+		The destination may be an existing sequential data set or an existing
+		PDS/PDSE member.  Set create=True to allocate a new sequential data set.
+		Existing sendJCL() callers retain their original wait-for-SYSOUT behavior.
+		"""
+		dataset = str(dataset).strip().upper()
+		dsn_pattern = (
+			r"[A-Z@#$][A-Z0-9@#$-]{0,7}"
+			r"(?:\.[A-Z@#$][A-Z0-9@#$-]{0,7})*"
+		)
+		member_match = re.fullmatch(
+			r"(" + dsn_pattern + r")\(([A-Z@#$][A-Z0-9@#$]{0,7})\)",
+			dataset
+		)
+		if member_match:
+			base_dsn = member_match.group(1)
+		else:
+			base_dsn = dataset
+		if not re.fullmatch(dsn_pattern, base_dsn):
+			raise ValueError("invalid z/OS data set name: {0}".format(dataset))
+		if len(base_dsn) > 44:
+			raise ValueError("z/OS data set name exceeds 44 characters")
+		if create and member_match:
+			raise ValueError("create=True only supports a sequential data set")
+
+		recfm = str(recfm).upper()
+		if recfm not in ('F', 'FB'):
+			raise ValueError("upload_text currently supports RECFM F or FB")
+		if not isinstance(lrecl, int) or not 1 <= lrecl <= 80:
+			raise ValueError("lrecl must be between 1 and 80")
+		if long_lines not in ('error', 'wrap', 'truncate'):
+			raise ValueError("long_lines must be 'error', 'wrap', or 'truncate'")
+
+		with open(local_path, 'r', encoding='ascii', newline=None) as source:
+			source_lines = source.read().splitlines()
+
+		data_lines = []
+		for line_number, line in enumerate(source_lines, 1):
+			if len(line) <= lrecl:
+				data_lines.append(line)
+			elif long_lines == 'truncate':
+				data_lines.append(line[:lrecl])
+			elif long_lines == 'wrap':
+				data_lines.extend(
+					line[offset:offset + lrecl]
+					for offset in range(0, len(line), lrecl)
+				)
+			else:
+				raise ValueError(
+					"line {0} is {1} characters; LRECL is {2}".format(
+						line_number, len(line), lrecl
+					)
+				)
+
+		# DLM must be exactly two characters.  Select one that cannot be
+		# mistaken for a data record in this particular input file.
+		data_set = set(data_lines)
+		delimiter = None
+		for first in 'ZQXWVUTSRPONMLKJIHGFEDCBA':
+			for second in 'ZQXWVUTSRPONMLKJIHGFEDCBA0123456789':
+				candidate = first + second
+				if candidate not in data_set:
+					delimiter = candidate
+					break
+			if delimiter:
+				break
+		if delimiter is None:
+			raise ValueError("could not select a safe two-character JCL delimiter")
+
+		jcl_lines = [
+			"//NJEUPLD JOB (NJE),'NJELIB',CLASS=A,MSGCLASS=H",
+			"//COPY     EXEC PGM=IEBGENER",
+			"//SYSPRINT DD SYSOUT=*",
+		]
+		if create:
+			for name, value in (
+				('primary', primary), ('secondary', secondary),
+				('blksize', blksize)
+			):
+				if not isinstance(value, int) or value < 0:
+					raise ValueError("{0} must be a non-negative integer".format(name))
+			if primary == 0:
+				raise ValueError("primary must be greater than zero")
+			unit = str(unit).strip().upper()
+			if not re.fullmatch(r"[A-Z0-9@#$]{1,8}", unit):
+				raise ValueError("invalid UNIT value")
+			jcl_lines.extend([
+				"//SYSUT2   DD DSN={0},".format(dataset),
+				"//            DISP=(NEW,CATLG,DELETE),UNIT={0},".format(unit),
+				"//            SPACE=(TRK,({0},{1})),".format(primary, secondary),
+				"//            DCB=(RECFM={0},LRECL={1},BLKSIZE={2})".format(
+					recfm, lrecl, blksize
+				),
+			])
+		else:
+			jcl_lines.append("//SYSUT2   DD DSN={0},DISP=OLD".format(dataset))
+
+		jcl_lines.extend([
+			"//SYSIN    DD DUMMY",
+			"//SYSUT1   DD DATA,DLM={0}".format(delimiter),
+		])
+		jcl_lines.extend(data_lines)
+		jcl_lines.append(delimiter)
+
+		for line_number, line in enumerate(jcl_lines, 1):
+			if len(line) > 80:
+				raise ValueError(
+					"generated JCL record {0} exceeds 80 columns: {1}".format(
+						line_number, line
+					)
+				)
+
+		temp_name = None
+		try:
+			with tempfile.NamedTemporaryFile(
+				mode='w', encoding='ascii', newline='\n',
+				prefix='njelib-upload-', suffix='.jcl', delete=False
+			) as temp_jcl:
+				temp_name = temp_jcl.name
+				for line in jcl_lines:
+					temp_jcl.write(line + '\n')
+			self.sendJCL(
+				temp_name, userid=userid, group=group,
+				wait_for_sysout=wait_for_sysout
+			)
+		finally:
+			if temp_name:
+				try:
+					os.unlink(temp_name)
+				except OSError:
+					pass
+
+		return {
+			'dataset': dataset,
+			'records': len(data_lines),
+			'lrecl': lrecl,
+			'recfm': recfm,
+			'created': bool(create),
+			'wait_for_sysout': bool(wait_for_sysout),
+		}
 
 	def dumbClient(self):
 		""" Connects to an NJE server and does nothing """
