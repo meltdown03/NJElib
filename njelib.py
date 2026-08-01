@@ -2078,9 +2078,19 @@ class NJE:
 			ip += str(struct.unpack('<B', ip_addr[i])[0])+"."
 		return ip[:-1]
 
-	def makeSYSIN_header(self, lines, jobnum, programmer, job_class, msg_class, job_name, acc, userid="ibmuser", group="sys1", passw=''):
+	def makeSYSIN_header(self, lines, jobnum, programmer, job_class, msg_class, job_name, acc, userid="ibmuser", group=None, passw=''):
 		""" Creates the necesary sections of the job headers for the NJE record """
 
+		userid = str(userid).strip().upper()
+		group = '' if group is None else str(group).strip().upper()
+		if not re.fullmatch(r"[A-Z0-9@#$]{1,8}", userid):
+			raise ValueError("userid must be 1-8 valid RACF name characters")
+		if group and not re.fullmatch(r"[A-Z0-9@#$]{1,8}", group):
+			raise ValueError("group must be 1-8 valid RACF name characters")
+
+		NJHTSUSR = self.padding(userid)
+		NJHTSNOD = self.RHOST
+		NJHTSGRP = self.padding(group)
 		NJHTOUSR = self.padding(userid)
 		NJHTOGRP = self.padding(group)
 
@@ -2143,22 +2153,28 @@ class NJE:
 						struct.pack(">h",len(acc) + 2) + b"\x01" + my_to_bytes(len(acc)) + self.AsciiToEbcdic(acc) )
 		acc_header = struct.pack(">h",len(acc_header) + 2) + acc_header
 
-		# NJHT		   LEN		TYPE	 MOD	LENP	   FLG0	 Reserved
-		sec_prefix = (b"\x00\x58" + b"\x8C" + b"\x00" + b"\x00\x04" + b"\x00" + b"\x00") #00:58:8c:00:00:04:00
-		# NJHT		   LENT	VERS	 FLG1	  STYP
-		sec_subsec = (b"\x50" + b"\x01" + b"\x32" + b"\x07" )
-		# Here's the important stuff the next byte is NJHTFLG2 with to important bits:
-		#	0x80: if not set it means that we (this script) confirmed the security was all good
-		#	0x08: If set, it means the user is a 'trusted' user
-		#sec_subsec += b"\x08"
-		sec_subsec += b"\x00"
+		# NJHTF0JB is off: this section describes the submitting identity.
+		# RACF can propagate that identity into the job owner according to the
+		# receiving node's NODES USERJ/GROUPJ profiles.
+		sec_prefix = (
+			b"\x00\x58" + b"\x8C" + b"\x00" + b"\x00\x04"
+			+ b"\x00" + b"\x00"
+		)
+		# External NJE format (0x40), originating without RACF (0x20), and
+		# batch-job security session type (0x07).
+		sec_subsec = b"\x50\x01\x60\x07"
+		# This client authenticates the NJE node, not the individual RACF user.
+		# Mark the supplied identity as default/unverified (0x80) and remotely
+		# originated (0x02); the receiving RACF policy decides whether it may be
+		# propagated, translated, or rejected.
+		sec_subsec += b"\x82"
 		# NJHT		POEX	  RESRVD	SECL		 CNOD	   SUSR + SNOD + SGRP
-		sec_subsec += (b"\x03" + b"\xC0\x00" + (b"\x00" * 8) + self.RHOST + (b"\x00" * 24) +
+		sec_subsec += (b"\x03" + b"\xC0\x00" + (b"\x00" * 8) + self.RHOST +
+					   NJHTSUSR + NJHTSNOD + NJHTSGRP +
 					   #POEN	   RESRVD
 					   self.padding("INTRDR") + (b"\x00" * 8) )
-		# Here's the next important parts: NJHTOUSR and NJHTOGRP
-		# Using these two fields we can specify any userid and group we want.
-		# The default is IBMUSER and SYS1.
+		# Owner fields mirror the submitting identity. They are assertions only;
+		# they do not bypass RACF validation or NODES-class policy.
 		self.msg("Setting Target User/Group: {0}/{1}".format(userid.upper(), group.upper()))
 		sec_subsec += NJHTOUSR + NJHTOGRP
 		sec_header = sec_prefix + sec_subsec
@@ -2402,7 +2418,7 @@ class NJE:
 		else:
 			return message
 
-	def sendJCL(self, filename, userid='ibmuser', group='sys1', wait_for_sysout=True):
+	def sendJCL(self, filename, userid='ibmuser', group=None, wait_for_sysout=True):
 		"""Send a JCL file, optionally waiting for a complete SYSOUT stream."""
 		self.msg("Processing JCL file")
 		completed_jobs_before = len(self._completed_sysout_jobs)
@@ -2476,7 +2492,7 @@ class NJE:
 					)
 #		self.signoff()
 
-	def upload_text(self, local_path, dataset, userid='ibmuser', group='sys1',
+	def upload_text(self, local_path, dataset, userid='ibmuser', group=None,
 			create=False, recfm='FB', lrecl=80, blksize=0,
 			primary=5, secondary=5, unit='SYSDA', long_lines='error',
 			wait_for_sysout=True):
@@ -2484,6 +2500,7 @@ class NJE:
 
 		The destination may be an existing sequential data set or an existing
 		PDS/PDSE member.  Set create=True to allocate a new sequential data set.
+		If group is omitted, RACF may select the propagated user's default group.
 		Existing sendJCL() callers retain their original wait-for-SYSOUT behavior.
 		"""
 		dataset = str(dataset).strip().upper()
