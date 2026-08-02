@@ -1,4 +1,4 @@
-    # NJE Python Library
+# NJE Python Library
 
 # What the hell is NJE?
 
